@@ -1,0 +1,7 @@
+streamlit>=1.30
+pandas>=2.3
+numpy
+scikit-learn
+prophet
+pyarrow
+fastparquet
