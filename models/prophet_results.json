@@ -1,0 +1,15 @@
+{
+  "model": "Prophet",
+  "target": "trend_days",
+  "n_train_days": 1051,
+  "n_test_days": 263,
+  "cv_mae_mean": 0.7631017825889039,
+  "cv_mae_std": 0.33137762545381083,
+  "cv_r2_mean": -0.30393093703106067,
+  "cv_r2_std": 0.49549055408862,
+  "cv_folds": 5,
+  "test_mae": 1.407360228528083,
+  "test_rmse": 1.8863930404314713,
+  "test_r2": -1.039602646914366,
+  "test_mape": 22.79753164842923
+}
