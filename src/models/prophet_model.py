@@ -236,58 +236,98 @@ def forecast_video_views(
     prophet_df = prepare_prophet_data(df, video_id, date_col, target_col)
     n_points = len(prophet_df)
 
-    # Flatten y values - handle potential nested arrays
-    y_values = prophet_df["y"].values
-    if hasattr(y_values[0], '__len__') and not isinstance(y_values[0], str):
-        # If values are arrays/lists, take first element
-        prophet_df["y"] = [float(v[0]) if hasattr(v, '__len__') else float(v) for v in y_values]
-    else:
-        prophet_df["y"] = prophet_df["y"].astype(float)
+    # Force y to be a simple 1D array of floats
+    prophet_df = prophet_df.copy()
+    prophet_df["y"] = pd.to_numeric(prophet_df["y"], errors='coerce').astype('float64')
+    prophet_df = prophet_df.dropna(subset=["y"])
+    n_points = len(prophet_df)
 
-    # Use linear growth (simpler, more robust) with good flexibility
-    if n_points < 10:
-        model = Prophet(
-            growth='linear',
-            daily_seasonality=False,
-            weekly_seasonality=False,
-            yearly_seasonality=False,
-            changepoint_prior_scale=0.5,  # High flexibility to follow data
-            interval_width=0.80
-        )
-    elif n_points < 30:
-        model = Prophet(
-            growth='linear',
-            daily_seasonality=False,
-            weekly_seasonality=False,
-            yearly_seasonality=False,
-            changepoint_prior_scale=0.3,
-            interval_width=0.80
-        )
-    else:
-        model = Prophet(
-            growth='linear',
-            daily_seasonality=False,
-            weekly_seasonality=True,
-            yearly_seasonality=False,
-            changepoint_prior_scale=0.2,
-            interval_width=0.80
-        )
+    if n_points < 2:
+        raise ValueError(f"Video has fewer than 2 valid data points after cleaning")
 
+    # Analyze video's growth pattern to determine forecast behavior
+    first_value = float(prophet_df["y"].iloc[0])
+    last_value = float(prophet_df["y"].iloc[-1])
+    total_growth = last_value - first_value
+
+    # Calculate daily growth rates
+    daily_changes = prophet_df["y"].diff().dropna().values
+    avg_daily_change = np.mean(daily_changes)
+    std_daily_change = np.std(daily_changes) if len(daily_changes) > 1 else avg_daily_change * 0.1
+
+    # Detect trend: accelerating, steady, or decelerating
+    if n_points >= 4:
+        first_quarter = daily_changes[:len(daily_changes)//2]
+        second_quarter = daily_changes[len(daily_changes)//2:]
+        early_growth = np.mean(first_quarter) if len(first_quarter) > 0 else avg_daily_change
+        late_growth = np.mean(second_quarter) if len(second_quarter) > 0 else avg_daily_change
+
+        # Growth momentum: >1 = accelerating, <1 = decelerating
+        if early_growth > 0:
+            momentum = late_growth / early_growth
+        else:
+            momentum = 1.0
+    else:
+        momentum = 1.0
+        early_growth = avg_daily_change
+        late_growth = avg_daily_change
+
+    # Use Prophet with moderate flexibility to fit this video's pattern
+    model = Prophet(
+        growth='linear',
+        daily_seasonality=False,
+        weekly_seasonality=False,
+        yearly_seasonality=False,
+        changepoint_prior_scale=0.3,  # Moderate - allows fitting the curve
+        n_changepoints=max(2, n_points // 2),
+        interval_width=0.80
+    )
     model.fit(prophet_df)
 
-    # Generate forecast
     future = model.make_future_dataframe(periods=periods)
     forecast = model.predict(future)
 
-    # Clip negative predictions (views can't be negative)
+    # Get last actual date
+    last_actual_date = prophet_df["ds"].max()
+
+    # Apply saturation decay ONLY to future predictions
+    for idx in forecast.index:
+        forecast_date = forecast.loc[idx, "ds"]
+
+        if forecast_date > last_actual_date:
+            days_ahead = (forecast_date - last_actual_date).days
+
+            # Get Prophet's linear projection
+            prophet_pred_value = forecast.loc[idx, "yhat"]
+            growth_from_last = prophet_pred_value - last_value
+
+            # Apply decay based on video's momentum
+            if momentum < 0.8:
+                decay = np.exp(-0.20 * days_ahead)
+            elif momentum < 1.0:
+                decay = np.exp(-0.10 * days_ahead)
+            elif momentum > 1.2:
+                decay = np.exp(-0.03 * days_ahead)
+            else:
+                decay = np.exp(-0.07 * days_ahead)
+
+            forecast.loc[idx, "yhat"] = last_value + growth_from_last * decay
+
+            # Scale confidence intervals
+            upper_growth = forecast.loc[idx, "yhat_upper"] - last_value
+            lower_growth = forecast.loc[idx, "yhat_lower"] - last_value
+            forecast.loc[idx, "yhat_upper"] = last_value + upper_growth * decay
+            forecast.loc[idx, "yhat_lower"] = last_value + lower_growth * decay
+
+    # Clip negative predictions
     forecast["yhat"] = forecast["yhat"].clip(lower=0)
     forecast["yhat_lower"] = forecast["yhat_lower"].clip(lower=0)
     forecast["yhat_upper"] = forecast["yhat_upper"].clip(lower=0)
 
-    # Calculate metrics on training data
-    train_forecast = forecast[forecast["ds"].isin(prophet_df["ds"])]
+    # Metrics from Prophet's fit on historical data (not modified)
+    hist_forecast = forecast[forecast["ds"] <= last_actual_date]
     y_true = prophet_df["y"].values
-    y_pred = train_forecast["yhat"].values
+    y_pred = hist_forecast["yhat"].head(len(y_true)).values
 
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))

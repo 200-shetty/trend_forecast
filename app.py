@@ -243,14 +243,10 @@ elif page == "Feature Analysis":
         account for {top_10.head(3)['cumulative_importance'].iloc[-1]*100:.1f}% of predictive power.
         """)
 
-
 # === PAGE: FORECAST EXPLORER ===
 elif page == "Forecast Explorer":
     st.title("Video Forecast Explorer")
-    st.markdown("""
-    Select a video to see its **historical trending performance** and generate a **Prophet forecast**
-    for future view counts.
-    """)
+    st.markdown("Analyze RandomForest predictions and compare with Prophet time series forecasts.")
 
     # Video selection
     video_counts = clean_df["video_id"].value_counts()
@@ -267,34 +263,75 @@ elif page == "Forecast Explorer":
 
     selected_display = st.selectbox(
         "Select Video",
-        video_options["display"].tolist()[:100],  # Limit for performance
+        video_options["display"].tolist()[:100],
         help="Videos with at least 3 trending days"
     )
 
-    # Get video ID from selection
     selected_row = video_options[video_options["display"] == selected_display].iloc[0]
     video_id = selected_row["video_id"]
     video_title = selected_row["title"]
     channel = selected_row["channelTitle"]
 
-    st.markdown(f"**Video**: {video_title}")
-    st.markdown(f"**Channel**: {channel}")
+    st.markdown(f"**{video_title}** by {channel}")
 
-    # Get video data for this video
     video_data = clean_df[clean_df["video_id"] == video_id][["trending_date", "views", "likes"]].copy()
     video_data = video_data.sort_values("trending_date")
     n_days = len(video_data)
 
-    st.info(f"This video has **{n_days} days** of trending data")
+    # === RANDOM FOREST PREDICTION ===
+    st.subheader("RandomForest Prediction")
 
-    # === HISTORICAL DATA SECTION ===
-    st.subheader("Historical Trending Performance")
-    st.markdown("""
-    This chart shows the **actual view and like counts** during the video's trending period.
-    Prophet uses this historical data to learn the video's growth pattern and generate forecasts.
-    """)
+    video_features = display_features[display_features["video_id"] == video_id]
+    
+    if len(video_features) > 0 and rf_model is not None:
+        rf_input = video_features.drop(
+            columns=["video_id", "trending_date", "title", "channelTitle", "country", "trend_days"],
+            errors="ignore"
+        )
+        
+        rf_predicted_days = rf_model.predict(rf_input)[0]
+        actual_trend_days = video_features["trend_days"].values[0]
+        prediction_error = abs(rf_predicted_days - actual_trend_days)
+        error_pct = (prediction_error / actual_trend_days * 100) if actual_trend_days > 0 else 0
 
-    # Better historical visualization with plotly
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric(
+                "Predicted Duration", 
+                f"{rf_predicted_days:.1f} days",
+                delta=f"{rf_predicted_days - actual_trend_days:+.1f}"
+            )
+        
+        with col2:
+            st.metric("Actual Duration", f"{actual_trend_days:.0f} days")
+        
+        with col3:
+            st.metric("Prediction Error", f"{error_pct:.1f}%")
+
+        importance = rf_model.get_feature_importance()
+        top_features = importance.head(5)
+        
+        feature_values = []
+        for feat in top_features["feature"]:
+            if feat in rf_input.columns:
+                val = rf_input[feat].values[0]
+                feature_values.append({
+                    "Feature": feat,
+                    "Value": f"{val:.2f}" if isinstance(val, (int, float)) else str(val),
+                    "Importance": f"{top_features[top_features['feature'] == feat]['importance'].values[0]:.3f}"
+                })
+        
+        if feature_values:
+            st.dataframe(pd.DataFrame(feature_values), hide_index=True, width="stretch")
+    else:
+        st.warning("RandomForest prediction unavailable for this video.")
+
+    st.markdown("---")
+
+    # === HISTORICAL DATA ===
+    st.subheader("Historical Performance")
+
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -323,150 +360,127 @@ elif page == "Forecast Explorer":
     )
 
     fig_hist.update_layout(
-        title="Historical Views & Likes During Trending Period",
+        title=f"Views & Likes Over {n_days} Days",
         hovermode="x unified"
     )
     fig_hist.update_xaxes(title_text="Date")
     fig_hist.update_yaxes(title_text="Views", secondary_y=False)
     fig_hist.update_yaxes(title_text="Likes", secondary_y=True)
 
-    st.plotly_chart(fig_hist, width='stretch')
+    st.plotly_chart(fig_hist, width="stretch")
 
-    # === FORECAST SECTION ===
-    st.subheader("Generate View Forecast")
+    # === PROPHET FORECAST ===
+    st.markdown("---")
+    st.subheader("Prophet Time Series Forecast")
+    
+    forecast_days = st.slider("Forecast Horizon (days)", 3, 14, 7, key=f"forecast_slider_{video_id}")
 
-    # Forecast parameters
-    forecast_days = st.slider("Forecast Horizon (days)", 3, 14, 7)
-
-    # Run forecast
-    if st.button("Generate Forecast", type="primary"):
+    if st.button("Generate Forecast", type="primary", key=f"forecast_button_{video_id}"):
         if n_days < 2:
-            st.error(f"Need at least 2 data points to forecast. This video only has {n_days}.")
+            st.error(f"Need at least 2 data points. This video has {n_days}.")
         else:
             with st.spinner("Fitting Prophet model..."):
                 try:
                     result = forecast_video_views(clean_df, video_id, periods=forecast_days)
                     forecast = result["forecast"]
 
-                    # Check if Prophet produced unrealistic results
-                    min_pred = forecast["yhat"].min()
-                    max_actual = video_data["views"].max()
-                    has_negative = min_pred < 0
-                    is_unrealistic = has_negative or (forecast["yhat"].max() > max_actual * 10)
-
-                    if has_negative or n_days < 10:
-                        st.markdown(f"""
-                        """)
-
-                    # Display metrics
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Training Points", result["n_training_points"])
-                    with col2:
-                        mae_val = result['metrics']['MAE']
-                        st.metric("MAE", f"{mae_val:,.0f}" if mae_val > 100 else f"{mae_val:.2f}")
-                    with col3:
-                        st.metric("R²", f"{result['metrics']['R2']:.3f}")
-
-                    # Forecast chart
-                    st.subheader("View Forecast")
-
                     forecast["ds"] = pd.to_datetime(forecast["ds"])
                     video_data_plot = video_data.copy()
                     video_data_plot["trending_date"] = pd.to_datetime(video_data_plot["trending_date"])
 
-                    # Clip predictions to reasonable values (no negative views)
                     forecast["yhat_clipped"] = forecast["yhat"].clip(lower=0)
                     forecast["yhat_upper_clipped"] = forecast["yhat_upper"].clip(lower=0)
                     forecast["yhat_lower_clipped"] = forecast["yhat_lower"].clip(lower=0)
 
+                    last_actual_date = video_data_plot["trending_date"].max()
+                    forecast_historical = forecast[forecast["ds"] <= last_actual_date]
+                    forecast_future = forecast[forecast["ds"] > last_actual_date]
+
                     fig = go.Figure()
 
-                    # 1. Upper confidence bound (invisible line for fill reference)
+                    if len(forecast_future) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=forecast_future["ds"],
+                            y=forecast_future["yhat_upper_clipped"],
+                            mode="lines",
+                            line=dict(width=0),
+                            showlegend=False,
+                            name="Upper"
+                        ))
+
+                        fig.add_trace(go.Scatter(
+                            x=forecast_future["ds"],
+                            y=forecast_future["yhat_lower_clipped"],
+                            mode="lines",
+                            line=dict(width=0),
+                            fill="tonexty",
+                            fillcolor="rgba(173, 216, 230, 0.5)",
+                            name="80% Confidence"
+                        ))
+
+                        fig.add_trace(go.Scatter(
+                            x=forecast_future["ds"],
+                            y=forecast_future["yhat_clipped"],
+                            mode="lines+markers",
+                            line=dict(color="blue", width=2, dash="dash"),
+                            marker=dict(size=5),
+                            name="Forecast"
+                        ))
+
                     fig.add_trace(go.Scatter(
-                        x=forecast["ds"],
-                        y=forecast["yhat_upper_clipped"],
+                        x=forecast_historical["ds"],
+                        y=forecast_historical["yhat_clipped"],
                         mode="lines",
-                        line=dict(width=0),
-                        showlegend=False,
-                        name="Upper"
+                        line=dict(color="lightblue", width=1),
+                        name="Fitted",
+                        opacity=0.5
                     ))
 
-                    # 2. Lower confidence bound with fill to previous trace
-                    fig.add_trace(go.Scatter(
-                        x=forecast["ds"],
-                        y=forecast["yhat_lower_clipped"],
-                        mode="lines",
-                        line=dict(width=0),
-                        fill="tonexty",
-                        fillcolor="rgba(173, 216, 230, 0.5)",
-                        name="80% Confidence Interval"
-                    ))
-
-                    # 3. Predicted line (on top of confidence interval)
-                    fig.add_trace(go.Scatter(
-                        x=forecast["ds"],
-                        y=forecast["yhat_clipped"],
-                        mode="lines+markers",
-                        line=dict(color="blue", width=2),
-                        marker=dict(size=5),
-                        name="Prophet Forecast"
-                    ))
-
-                    # 4. Actual historical data (most visible - on top)
                     fig.add_trace(go.Scatter(
                         x=video_data_plot["trending_date"],
                         y=video_data_plot["views"],
                         mode="lines+markers",
-                        name="Actual Views",
+                        name="Actual",
                         line=dict(color="red", width=3),
                         marker=dict(size=10, color="red")
                     ))
 
-                    # Layout
                     fig.update_layout(
-                        title="Prophet View Forecast with 80% Confidence Interval",
+                        title=f"Prophet Forecast ({forecast_days} days ahead)",
                         xaxis_title="Date",
                         yaxis_title="Views",
                         yaxis=dict(rangemode="tozero"),
-                        hovermode="x unified",
-                        legend=dict(
-                            orientation="h",
-                            yanchor="bottom",
-                            y=1.02,
-                            xanchor="left",
-                            x=0
-                        ),
-                        showlegend=True
+                        hovermode="x unified"
                     )
 
-                    st.plotly_chart(fig, width='stretch')
+                    st.plotly_chart(fig, width="stretch")
 
-                    st.markdown("""
-                    - **Red line with dots**: Actual historical views (training data)
-                    - **Blue line**: Prophet's forecast
-                    - **Light blue shaded area**: 80% confidence interval (uncertainty range)
-                    """)
+                    if len(forecast_future) > 0:
+                        last_actual_views = video_data["views"].iloc[-1]
+                        final_forecast_views = forecast_future["yhat_clipped"].iloc[-1]
+                        predicted_growth = final_forecast_views - last_actual_views
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Current Views", f"{last_actual_views:,.0f}")
+                        with col2:
+                            st.metric(
+                                f"Predicted (+{forecast_days}d)", 
+                                f"{final_forecast_views:,.0f}",
+                                delta=f"{predicted_growth:+,.0f}"
+                            )
 
-                    if is_unrealistic:
-                        st.error("""
-                        **Note**: Prophet generated unrealistic predictions (negative or extreme values).
-                        This demonstrates why **RandomForest is the better model** for this dataset -
-                        it uses video-specific features rather than just time series patterns.
-                        """)
-
-                    # Download button
                     st.download_button(
-                        "Download Forecast CSV",
+                        "Download Forecast",
                         forecast.to_csv(index=False),
                         file_name=f"{video_id}_forecast.csv",
-                        mime="text/csv"
+                        mime="text/csv",
+                        key=f"download_{video_id}_{forecast_days}"
                     )
 
                 except Exception as e:
-                    st.error(f"Error generating forecast: {str(e)}")
-                    st.info("Try selecting a different video with more data points.")
-
+                    st.error(f"Forecast failed: {str(e)}")
+                    st.info("Try a different video with more data points.")
 
 # Footer
 st.markdown("---")
